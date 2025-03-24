@@ -1,84 +1,62 @@
 import os
 import random
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+from torchvision import transforms
+import torch
+from torch.utils.data import Dataset
 
-class CancerDataset(Dataset):
-    def __init__(self, cancer_folders, img_size=(28, 28), num_samples_per_class=1, transform=None):
-        self.cancer_folders = cancer_folders
-        self.img_size = img_size
-        self.num_samples_per_class = num_samples_per_class
-        self.transform = transform
-        self.image_paths = self._get_image_paths()
+class MetaDataset(Dataset):
+    def __init__(self, root_dir, ways=5, shots=1, queries=15, transform=None):
+        """
+        Args:
+            root_dir: path to the dataset folder with one folder per class.
+            ways: number of classes per task.
+            shots: number of support examples per class.
+            queries: number of query examples per class.
+            transform: torchvision transforms to apply (default converts image to tensor).
+        """
+        self.root_dir = root_dir
+        self.ways = ways
+        self.shots = shots
+        self.queries = queries
+        self.transform = transform if transform is not None else transforms.ToTensor()
 
-    def _get_image_paths(self):
-        image_paths = []
-        for folder in self.cancer_folders:
-            images = [os.path.join(folder, img) for img in os.listdir(folder) if img.endswith('.png')]
-            random.shuffle(images)
-            image_paths.extend(images[:self.num_samples_per_class])
-        return image_paths
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('L')
-        image = image.resize(self.img_size)
-        image = np.array(image, dtype=np.float32) / 255.0
-        image = torch.tensor(image).unsqueeze(0)  # Add channel dimension
-        return image
-
-class SinusoidDataset(Dataset):
-    def __init__(self, batch_size, num_samples_per_class, amp_range=(0.1, 5.0), phase_range=(0, np.pi), input_range=(-5.0, 5.0)):
-        self.batch_size = batch_size
-        self.num_samples_per_class = num_samples_per_class
-        self.amp_range = amp_range
-        self.phase_range = phase_range
-        self.input_range = input_range
-        self.data = self._generate_sinusoid_batch()
-
-    def _generate_sinusoid_batch(self):
-        amp = np.random.uniform(self.amp_range[0], self.amp_range[1], [self.batch_size])
-        phase = np.random.uniform(self.phase_range[0], self.phase_range[1], [self.batch_size])
-        inputs = np.random.uniform(self.input_range[0], self.input_range[1], [self.batch_size, self.num_samples_per_class, 1])
-        outputs = amp[:, None] * np.sin(inputs - phase[:, None])
-        return torch.tensor(inputs, dtype=torch.float32), torch.tensor(outputs, dtype=torch.float32)
+        # List class folders (each subfolder is a class)
+        self.class_folders = [os.path.join(root_dir, cls) for cls in os.listdir(root_dir)
+                              if os.path.isdir(os.path.join(root_dir, cls))]
+        self.class_to_images = {}
+        for folder in self.class_folders:
+            cls_name = os.path.basename(folder)
+            images = [os.path.join(folder, img) for img in os.listdir(folder)
+                      if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            self.class_to_images[cls_name] = images
+        self.classes = list(self.class_to_images.keys())
 
     def __len__(self):
-        return self.batch_size
+        # Arbitrarily large since tasks are sampled on the fly.
+        return 1000000
 
     def __getitem__(self, idx):
-        return self.data[0][idx], self.data[1][idx]
-
-class DataGenerator:
-    def __init__(self, num_samples_per_class, batch_size, datasource='CancerCell', config={}):
-        self.num_samples_per_class = num_samples_per_class
-        self.batch_size = batch_size
-        self.datasource = datasource
-        self.img_size = config.get('img_size', (28, 28))
-        self.num_classes = config.get('num_classes', 1)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if datasource == 'sinusoid':
-            self.dataset = SinusoidDataset(batch_size, num_samples_per_class)
-        elif datasource == 'CancerCell':
-            data_folder = config.get('data_folder', './data')
-            cancer_folders = [os.path.join(data_folder, family, cell)
-                                 for family in os.listdir(data_folder)
-                                 if os.path.isdir(os.path.join(data_folder, family))
-                                 for cell in os.listdir(os.path.join(data_folder, family))]
-            random.seed(1)
-            random.shuffle(cancer_folders)
-            num_train = config.get('num_train', 1200) - 100
-            self.metatrain_cancer_folders = cancer_folders[:num_train]
-            self.metaval_cancer_folders = cancer_folders[num_train:num_train+100]
-            self.dataset = CancerDataset(self.metatrain_cancer_folders, self.img_size, num_samples_per_class)
-        else:
-            raise ValueError('Unrecognized data source')
-
-    def get_dataloader(self, train=True):
-        return DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
+        # Randomly sample "ways" classes for the task.
+        selected_classes = random.sample(self.classes, self.ways)
+        support_images, support_labels = [], []
+        query_images, query_labels = [], []
+        label_map = {cls: i for i, cls in enumerate(selected_classes)}
+        for cls in selected_classes:
+            imgs = self.class_to_images[cls]
+            # Ensure there are enough images per class.
+            assert len(imgs) >= self.shots + self.queries, f"Not enough images in class {cls}"
+            selected_imgs = random.sample(imgs, self.shots + self.queries)
+            for i in range(self.shots):
+                img = Image.open(selected_imgs[i]).convert('RGB')
+                support_images.append(self.transform(img))
+                support_labels.append(label_map[cls])
+            for i in range(self.shots, self.shots + self.queries):
+                img = Image.open(selected_imgs[i]).convert('RGB')
+                query_images.append(self.transform(img))
+                query_labels.append(label_map[cls])
+        support_images = torch.stack(support_images)  # shape: [ways*shots, C, H, W]
+        query_images = torch.stack(query_images)      # shape: [ways*queries, C, H, W]
+        support_labels = torch.tensor(support_labels)
+        query_labels = torch.tensor(query_labels)
+        return support_images, support_labels, query_images, query_labels
